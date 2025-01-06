@@ -24,7 +24,7 @@ if not os.path.isdir(inputs['SavePath']):
     os.mkdir(inputs['SavePath'])
 
 current_day = str(inputs['StartNight'][:10])
-tel = telescope.create_tel(inputs['Telescope'])
+tel = telescope.create_tel(inputs['Telescope'],inputs['NumberTimeslots'])
 startObs = Time(inputs['StartNight'], format='isot')
 endObs = Time(inputs['EndNight'], format='isot')
 total_time = np.round((endObs.jd-startObs.jd)*24,3)
