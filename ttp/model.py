@@ -24,7 +24,7 @@ class TTPModel(object):
         outputdir (str): the path to save the outputs of the model
 
     """
-    def __init__(self,start,stop,stars,observatory,outputdir,runtime=300,optgap=0.01,useHighEl=True):
+    def __init__(self,start,stop,stars,observatory,outputdir,runtime=300,optgap=0.01,useHighEl=False):
 
         self.observatory = observatory
         self.stars = stars
@@ -108,6 +108,9 @@ class TTPModel(object):
                         good = elevationChecker
                     else: # if target is not above desired lower limit for at least an hour, then lower elevations are acceptable
                         good = np.where(self.observatory.is_up(alt,az) == 1)[0]
+                if s.max_airmass is not None:
+                    min_el_deg = 90-(180/np.pi)*np.arccos(1/s.max_airmass)
+                    good = np.where(self.observatory.is_up_highElevation(alt,az,elvLimit=min_el_deg) == 1)[0]
                 else:
                     good = np.where(self.observatory.is_up(alt,az) == 1)[0]
                 # once the "good" array is set, it determines the first and last available exposure starts of the night
@@ -173,44 +176,70 @@ class TTPModel(object):
         for i in range(N)[1:-1]:
             star = self.stars[nodes[i]]
             targets.append(star.target)
-        coordinate_matrix = self.observatory.observer.altaz(
-                                    times,targets,grid_times_targets=True)
+        
+        if self.observatory.mounttype == 'altaz':
+            coordinate_matrix = self.observatory.observer.altaz(
+                                        times,targets,grid_times_targets=True)
 
 
-        def to_wrap_frame(angle):
-            if self.observatory.wrapLimitAngle:
-                angle += (360-self.observatory.wrapLimitAngle)
-                angle = np.array([x - 360 if x > 360 else x for x in angle])
-            return angle
+            def to_wrap_frame(angle):
+                if self.observatory.wrapLimitAngle:
+                    angle += (360-self.observatory.wrapLimitAngle)
+                    angle = np.array([x - 360 if x > 360 else x for x in angle])
+                return angle
 
-        def max_ang_sep(targ1,targ2,slot):
+            def max_ang_sep(targ1,targ2,slot):
 
-            slot_ind_start = slot*samples_per_slot
-            slot_ind_end = (slot+1)*samples_per_slot-1
+                slot_ind_start = slot*samples_per_slot
+                slot_ind_end = (slot+1)*samples_per_slot-1
 
-            # Subtract 1 since there's no dummy starting node in the coordinate matrix
-            coords1 = coordinate_matrix[targ1-1,slot_ind_start:slot_ind_end+1]
-            coords2 = coordinate_matrix[targ2-1,slot_ind_start:slot_ind_end+1]
+                # Subtract 1 since there's no dummy starting node in the coordinate matrix
+                coords1 = coordinate_matrix[targ1-1,slot_ind_start:slot_ind_end+1]
+                coords2 = coordinate_matrix[targ2-1,slot_ind_start:slot_ind_end+1]
 
-            alt1 = coords1.alt.deg
-            alt2 = coords2.alt.deg
-            az1 = to_wrap_frame(coords1.az.deg)
-            az2 = to_wrap_frame(coords2.az.deg)
+                alt1 = coords1.alt.deg
+                alt2 = coords2.alt.deg
+                az1 = to_wrap_frame(coords1.az.deg)
+                az2 = to_wrap_frame(coords2.az.deg)
 
-            # Take the maximum of all the samples, in both dimensions
-            alt_sep = np.abs(alt1-alt2)
-            az_sep = np.abs(az1-az2)
+                # Take the maximum of all the samples, in both dimensions
+                alt_sep = np.abs(alt1-alt2)
+                az_sep = np.abs(az1-az2)
 
-            # For telescopes without wraps, no slew greater than 180 deg can exist
-            if not self.observatory.wrapLimitAngle:
-                az_sep = [360 - x if x > 180 else x for x in az_sep]
+                # For telescopes without wraps, no slew greater than 180 deg can exist
+                if not self.observatory.wrapLimitAngle:
+                    az_sep = [360 - x if x > 180 else x for x in az_sep]
 
-            return max(max(alt_sep),max(az_sep))
+                return max(max(alt_sep),max(az_sep))
 
-        tau_slew = defaultdict(float) # Holds minutes
-        for m in range(M):
-            for targ1,targ2 in permutations(range(N)[1:-1],2):
-                tau_slew[(targ1,targ2,m)] = np.round(max_ang_sep(targ1,targ2,m)/(60*self.observatory.slewrate),3)
+            tau_slew = defaultdict(float) # Holds minutes
+            for m in range(M):
+                for targ1,targ2 in permutations(range(N)[1:-1],2):
+                    tau_slew[(targ1,targ2,m)] = np.round(max_ang_sep(targ1,targ2,m)/(60*self.observatory.slewrate),3)
+
+        if self.observatory.mounttype == 'equatorial':
+
+            def max_ang_sep(targ1,targ2,slot):
+
+                # Subtract 1 since there's no dummy starting node in the coordinate matrix
+                coords1 = targets[targ1-1].coord
+                coords2 = targets[targ2-1].coord
+
+                ra1 = coords1.ra.deg
+                ra2 = coords2.ra.deg
+                dec1 = coords1.dec.deg
+                dec2 = coords2.dec.deg
+
+                # Take the maximum of all the samples, in both dimensions
+                ra_sep = np.abs(ra1-ra2)
+                dec_sep = np.abs(dec1-dec2)
+
+                return max(ra_sep,dec_sep)
+
+            tau_slew = defaultdict(float) # Holds minutes
+            for m in range(M):
+                for targ1,targ2 in permutations(range(N)[1:-1],2):
+                    tau_slew[(targ1,targ2,m)] = np.round(max_ang_sep(targ1,targ2,m)/(60*self.observatory.slewrate),3)
 
         # Slot start and end times as minutes from start
         w = (slot_bounds.jd-slot_bounds[0].jd)*24*60
@@ -394,24 +423,42 @@ class TTPModel(object):
                     if np.round(t,1) != 0:
                         minutes = np.round(t,1)
                         time_of_slew = self.nightstarts + TimeDelta(minutes*60,format='sec')
-                        altaz1 = self.observatory.observer.altaz(time_of_slew,self.stars[self.node_to_star[i]].target)
-                        altaz2 = self.observatory.observer.altaz(time_of_slew,self.stars[self.node_to_star[j]].target)
+                        if self.observatory.mounttype == 'altaz':
+                            altaz1 = self.observatory.observer.altaz(time_of_slew,self.stars[self.node_to_star[i]].target)
+                            altaz2 = self.observatory.observer.altaz(time_of_slew,self.stars[self.node_to_star[j]].target)
 
-                        alt1 = altaz1.alt.deg
-                        alt2 = altaz2.alt.deg
-                        az1 = to_wrap_frame(altaz1.az.deg)
-                        az2 = to_wrap_frame(altaz2.az.deg)
+                            alt1 = altaz1.alt.deg
+                            alt2 = altaz2.alt.deg
+                            az1 = to_wrap_frame(altaz1.az.deg)
+                            az2 = to_wrap_frame(altaz2.az.deg)
 
-                        alt_sep = np.abs(alt1-alt2)
-                        az_sep = np.abs(az1-az2)
+                            alt_sep = np.abs(alt1-alt2)
+                            az_sep = np.abs(az1-az2)
 
-                        # For telescopes without wraps, no slew greater than 180 deg can exist
-                        if not self.observatory.wrapLimitAngle:
-                            if az_sep >= 180:
-                                az_sep = 360 - az_sep
+                            # For telescopes without wraps, no slew greater than 180 deg can exist
+                            if not self.observatory.wrapLimitAngle:
+                                if az_sep >= 180:
+                                    az_sep = 360 - az_sep
 
-                        separation = max(alt_sep,az_sep)
-                        slew = separation/(60*self.observatory.slewrate)
+                            separation = max(alt_sep,az_sep)
+                            slew = separation/(60*self.observatory.slewrate)
+
+                        if self.observatory.mounttype == 'equatorial':
+                            # Subtract 1 since there's no dummy starting node in the coordinate matrix
+                            coords1 = self.stars[self.node_to_star[i]].target.coord
+                            coords2 = self.stars[self.node_to_star[j]].target.coord
+
+                            ra1 = coords1.ra.deg
+                            ra2 = coords2.ra.deg
+                            dec1 = coords1.dec.deg
+                            dec2 = coords2.dec.deg
+
+                            # Take the maximum of all the samples, in both dimensions
+                            ra_sep = np.abs(ra1-ra2)
+                            dec_sep = np.abs(dec1-dec2)
+
+                            separation = max(ra_sep,dec_sep)
+                            slew = separation/(60*self.observatory.slewrate)
 
                         real_slews.append(np.round(slew,3))
 

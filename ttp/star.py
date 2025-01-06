@@ -56,6 +56,7 @@ class star(object):
         self.dec = float(row['Dec'])
         coords = SkyCoord(self.ra*u.deg, self.dec*u.deg, frame='icrs')
         self.priority = int(row['Priority'])
+        self.max_airmass = float(row['Maximum Airmass'])
         self.target = apl.FixedTarget(name=self.name, coord=coords)
         self.exptime = np.round(float(row['Exposure Time']/60),2) # Seconds to minutes
         self.shots = int(row['Exposures Per Visit'])
