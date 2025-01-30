@@ -2,5 +2,6 @@ StarListFile : ../tutorial/TKStargets.csv
 StartNight : 2024-02-11T07:00:00
 EndNight : 2024-02-11T14:00:00
 Telescope : HALE
-NumberTimeslots : 3
+NumberTimeslots : 5
 SavePath : ../tutorial/outputs/
+ExposureTimeFrame : ../tutorial/texp.csv

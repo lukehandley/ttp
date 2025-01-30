@@ -24,10 +24,11 @@ class TTPModel(object):
         outputdir (str): the path to save the outputs of the model
 
     """
-    def __init__(self,start,stop,stars,observatory,outputdir,runtime=300,optgap=0.01,useHighEl=False):
+    def __init__(self,start,stop,stars,observatory,exp_time_dataframe,outputdir,runtime=300,optgap=0.01,useHighEl=False):
 
         self.observatory = observatory
         self.stars = stars
+        self.exp_time_dataframe = exp_time_dataframe
         self.nightstarts = start
         self.nightends = stop
         self.outputdir = outputdir
@@ -96,7 +97,10 @@ class TTPModel(object):
             else:
                 s = self.stars[node_to_star[i]]
                 prios.append(int(s.priority))
-                tau_exp.append(s.exptime + ((self.observatory.readOutTime/60)*(s.shots-1)))
+                # Exposure time is now stored in the tau_slew object for variable exposure times
+                # Keeping it here in order to estimate the time bounds. TODO: make the bounds robust to
+                # the changes in exposure time.
+                tau_exp.append(s.exptime*s.shots + ((self.observatory.readOutTime/60)*(s.shots-1)))
                 tau_sep.append(s.intra_night_cadence * 60) # Hours -> minutes
                 AZ = self.observatory.observer.altaz(t, s.target)
                 alt=AZ.alt.deg
@@ -137,6 +141,9 @@ class TTPModel(object):
         """Compute the slew tensor which holds the worst case estimate of the
         slews between any two targets during any time slot.
 
+        For this feature branch, the time-dependent slew is replaced with a time-dependent
+        exposure time
+
         Args:
             cad (int): Maximum spacing in minutes at which to sample the slew
                 during every slot
@@ -170,12 +177,15 @@ class TTPModel(object):
 
         nodes = self.node_to_star
         N = self.N
+        exp_time_dataframe = self.exp_time_dataframe
 
         # Loop through targets, then evaluate coordinates at all times for all targets
         targets = []
+        star_objs = []
         for i in range(N)[1:-1]:
             star = self.stars[nodes[i]]
             targets.append(star.target)
+            star_objs.append(star)
         
         if self.observatory.mounttype == 'altaz':
             coordinate_matrix = self.observatory.observer.altaz(
@@ -234,11 +244,36 @@ class TTPModel(object):
                 ra_sep = np.abs(ra1-ra2)
                 dec_sep = np.abs(dec1-dec2)
 
-                return max(ra_sep,dec_sep)
+                slewtime = max(ra_sep,dec_sep)
+
+                return slewtime
+            
+            def median_exp_time(targ1,slot):
+
+                #Now collect the exposure times within the range of times
+                # Currently taking the median, but could use any estimator
+                tmin = slot_bounds[slot]
+                tmax = slot_bounds[slot+1]
+
+                # Recall that times should be in seconds here
+                star_obj = star_objs[targ1-1]
+                starname = star_obj.name
+                times_in_timeslot = exp_time_dataframe[(exp_time_dataframe['jd'] >= tmin.jd) & (exp_time_dataframe['jd'] <= tmax.jd)]
+                times_for_target = times_in_timeslot[starname]
+                exptime = np.nanmedian(times_for_target)
+                if exptime > 0:
+                    return exptime
+                # Check for nan slots (target below horizon)
+                else:
+                    return 1e5
 
             tau_slew = defaultdict(float) # Holds minutes
+            tau_exp_matrix = defaultdict(float)
             for m in range(M):
                 for targ1,targ2 in permutations(range(N)[1:-1],2):
+                    s = star_objs[targ1-1]
+                    exp_in_slot = np.round(float(median_exp_time(targ1,m)*s.shots + (self.observatory.readOutTime/60)*(s.shots-1)),2)
+                    tau_exp_matrix[(targ1,m)] = np.round(exp_in_slot,3)
                     tau_slew[(targ1,targ2,m)] = np.round(max_ang_sep(targ1,targ2,m)/(60*self.observatory.slewrate),3)
 
         # Slot start and end times as minutes from start
@@ -246,6 +281,7 @@ class TTPModel(object):
 
         self.w = w
         self.tau_slew = tau_slew
+        self.tau_exp_matrix = tau_exp_matrix
 
 
     def to_gurobi_model(self,output_flag=True):
@@ -271,11 +307,12 @@ class TTPModel(object):
         w = self.w
         tau_slew = self.tau_slew
         tau_exp = self.tau_exp
+        tau_exp_matrix = self.tau_exp_matrix
         te = self.te
         tl = self.tl
         tau_sep = self.tau_sep
 
-        # Variables and Constraints, all with the same conventions as Handley 2024
+        # Variables and Constraints, all with the same conventions as Handley 2024a
         Yi = Mod.addVars(range(N),vtype=GRB.BINARY,name='Yi')
         Xijm = Mod.addVars(range(N),range(N),range(M),vtype=GRB.BINARY,name='Xijm')
         tijm = Mod.addVars(range(N),range(N),range(M),vtype=GRB.CONTINUOUS,name='tijm')
@@ -292,7 +329,8 @@ class TTPModel(object):
         flow_constr = Mod.addConstrs(((gp.quicksum(Xijm[i,k,m] for i in range(N)[:-1] for m in range(M))
                         - gp.quicksum(Xijm[k,j,m] for j in range(N)[1:] for m in range(M)) == 0)
                         for k in range(N)[:-1][1:]), 'flow_constr')
-        exp_constr = Mod.addConstrs((ti[j] >= gp.quicksum(tijm[i,j,m] + (tau_slew[(i,j,m)] + tau_exp[j])*Xijm[i,j,m]
+        # The exposure times are now represented by a matrix instead of flat values
+        exp_constr = Mod.addConstrs((ti[j] >= gp.quicksum(tijm[i,j,m] + (tau_slew[(i,j,m)] + tau_exp_matrix[(j,m)])*Xijm[i,j,m]
                         for i in range(N)[:-1] for m in range(M)) for j in range(N)[1:])
                         , 'exp_constr')
         t_min = Mod.addConstrs(((tijm[i,j,m] >= w[m]*Xijm[i,j,m]) for j in range(N) for m in range(M)
@@ -316,6 +354,8 @@ class TTPModel(object):
         slew_param = 1/100
 
         # Maximize number of observations, with a penalty term for long slews
+        # The objective is now penalized by long exposures. Should check that this does not
+        # have unintended effects
         Mod.setObjective(gp.quicksum(priority_param[j]*Yi[j] for j in range(N)[1:-1])
                             -slew_param *gp.quicksum(tau_slew[(i,j,m)]*Xijm[i,j,m] for i in range(N)[1:-1]
                                         for j in range(N)[1:-1] for m in range(M))
@@ -377,6 +417,7 @@ class TTPModel(object):
         N = self.N
         M = self.M
         tau_slew = self.tau_slew
+        tau_exp_matrix = self.tau_exp_matrix
         Mod = self.gurobi_model
 
         num_scheduled = 0
@@ -406,13 +447,20 @@ class TTPModel(object):
             return angle
 
         # Get slew estimate from the tau tensor
+        # Also get the exposure time for this feature branch
         est_slews = []
-        for i in range(N)[1:-1]:
+        variable_exp_times = defaultdict(float)
+        for i in range(N)[0:-1]:
             for j in range(N)[1:-1]:
                 for m in range(M):
                     var = Mod.getVarByName(f'Xijm[{i},{j},{m}]').X
                     if np.round(var,0) ==1:
-                        est_slews.append(tau_slew[i,j,m])
+                        variable_exp_times[j] = tau_exp_matrix[j,m]
+                        if i > 0:
+                            est_slews.append(tau_slew[i,j,m])
+        self.variable_exp_times = variable_exp_times
+                        
+        #print(variable_exp_times)
 
         # Compute the real slew at the time the scheduler chose
         real_slews = []
@@ -472,6 +520,7 @@ class TTPModel(object):
             unordered_times.append(int(scheduled_targets[i][1]))
         order = np.argsort(unordered_times)
         scheduled_targets = [scheduled_targets[i] for i in order]
+        self.scheduled_targets = scheduled_targets
 
         # Get properly ordered metadata
         starnames = []
@@ -493,13 +542,15 @@ class TTPModel(object):
             starnames.append(s.name)
             priorities.append(s.priority)
             n_shots.append(s.shots)
-            exptimes.append(s.exptime)
+            exp_time_in_slot = variable_exp_times[node_ind]
+            exptimes.append(exp_time_in_slot)
+            true_exp_with_readout = np.round(exp_time_in_slot,2)
 
             # Observation start + end times, as both time objects and as
             # minute markers from the start of the night
-            t1 = Time(self.nightstarts.jd + pair[1]/(24*60),format='jd') - TimeDelta(60*s.expwithreadout,format='sec')
+            t1 = Time(self.nightstarts.jd + pair[1]/(24*60),format='jd') - TimeDelta(60*true_exp_with_readout,format='sec')
             t2 = Time(self.nightstarts.jd + pair[1]/(24*60),format='jd')
-            t_starts.append(pair[1] - s.expwithreadout)
+            t_starts.append(pair[1] - true_exp_with_readout)
             t_ends.append(pair[1])
 
             # Add times, az_path, and alt_path as attributes for easy plotting
@@ -580,7 +631,7 @@ class TTPModel(object):
         time_exposing = 0
         for i in range(self.N)[1:-1]:
             Y = Mod.getVarByName(f'Yi[{i}]').x
-            time_exposing += Y*self.tau_exp[i]
+            time_exposing += Y*self.variable_exp_times[i]
         time_idle = self.dur - time_exposing - slewtime
 
         # Save aspects of the best solution and the tightest bound to get theoretical

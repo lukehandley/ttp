@@ -168,7 +168,7 @@ class HALE(object):
         self.deckAzLim2 = 0
         self.deckAltLim = 0
         self.vigLim = 20
-        self.zenLim = 85 # Note, this cannot be 0 or no observations can be scheduled.
+        self.zenLim = 90 # Note, this cannot be 0 or no observations can be scheduled.
         self.nSlots = nSlots
 
     def pointing_limits(self, az, unvignetted=True):

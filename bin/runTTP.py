@@ -31,8 +31,9 @@ total_time = np.round((endObs.jd-startObs.jd)*24,3)
 print("Time in Night for Observations: " + str(total_time) + " hours.")
 
 targlist = formatting.theTTP(inputs['StarListFile'])
+exp_time_dataframe = pd.read_csv(inputs['ExposureTimeFrame'])
 print("Solving optimal slew path.")
-solution = model.TTPModel(startObs, endObs, targlist, tel, inputs['SavePath'])
+solution = model.TTPModel(startObs, endObs, targlist, tel, exp_time_dataframe, inputs['SavePath'])
 solutionDict = solution.schedule
 
 print("Solution found.")
@@ -48,6 +49,7 @@ print("Generating the Night Plan plots")
 plotting.nightPlan(solution.plotly, current_day, outputdir=inputs['SavePath'])
 print("Producing animated slewpath.")
 plotting.animate_telescope(solution, startObs, endObs, outputdir=inputs['SavePath'], animationStep=120)
+plotting.plot_slew_histogram(solution, outputdir=inputs['SavePath'])
 print()
 print()
 print("Done. Clear skies!")
