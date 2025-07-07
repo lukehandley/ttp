@@ -1,11 +1,7 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
 from astropy.time import Time
-from astropy.time import TimeDelta
 import sys
 import os
-import imageio
 sys.path.append('../ttp/')
 import formatting
 import telescope
