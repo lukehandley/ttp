@@ -150,6 +150,7 @@ class TTPModel(object):
 
         # Will want to accomodate slot input value
         M = self.observatory.nSlots
+        import pdb; pdb.set_trace()
         self.M = M
         night_dur = (self.nightends.jd - self.nightstarts.jd)*24*60 # minutes
 
@@ -308,6 +309,7 @@ class TTPModel(object):
         print('Solving TTP for {} exposures with Gurobi'.format(self.N-2))
         self.to_gurobi_model()
         Mod = self.gurobi_model
+        Mod.params.Heuristics = 0.5
         Mod.optimize()
 
 

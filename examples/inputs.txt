@@ -1,0 +1,5 @@
+StarListFile : ../examples/kpfcc-backup-selected-stars-2025-07-06.csv
+StartNight : 2025-07-07T07:00:00
+EndNight : 2025-07-07T10:00:00
+Telescope : Keck1
+SavePath : ../examples/outputs/
