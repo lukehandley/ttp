@@ -1,12 +1,8 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
 from astropy.time import Time
-from astropy.time import TimeDelta
 import sys
 import os
-import imageio
-sys.path.append('../ttp/')
+sys.path.append('./ttp/')
 import formatting
 import telescope
 import plotting
@@ -45,9 +41,9 @@ plotting.writeStarList(solution.plotly, startObs, current_day, outputdir=inputs[
 print("Plotting the 2D path.")
 plotting.plot_path_2D(solution, outputdir=inputs['SavePath'])
 print("Generating the Night Plan plots")
-plotting.nightPlan(solution.plotly, current_day, outputdir=inputs['SavePath'])
-print("Producing animated slewpath.")
-plotting.animate_telescope(solution, startObs, endObs, outputdir=inputs['SavePath'], animationStep=120)
+plotting.nightPlan(solution.plotly, current_day, outputdir=inputs['SavePath'], model=solution)
+# print("Producing animated slewpath.")
+# plotting.animate_telescope(solution, startObs, endObs, outputdir=inputs['SavePath'], animationStep=120)
 print()
 print()
 print("Done. Clear skies!")

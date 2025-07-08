@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import star
+import ttp.star as star
 
 def theTTP(filename):
     """Read in a .csv file of targets and convert them to star objects

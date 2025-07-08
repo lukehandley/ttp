@@ -16,9 +16,8 @@ you have a particularly powerful computer and/or a strong need.
 def create_tel(user_input):
 
     class_ = tel_map.get(user_input)
-
     if class_:
-        tel = class_()
+        tel = class_(nSlots=1)
         return tel
     else:
         print("This observatory is not in our pre-built classes. See the telescope.py file for instructions on how to add your own custom built telescope class. Exiting, this will break code.")
@@ -40,7 +39,7 @@ class Keck1(object):
         self.deckAzLim1 = 5.3
         self.deckAzLim2 = 146.2
         self.deckAltLim = 33.3
-        self.vigLim = 30
+        self.vigLim = 18
         self.zenLim = 84 # Note, this cannot be 0 or no observations can be scheduled.
         self.nSlots = nSlots
 
