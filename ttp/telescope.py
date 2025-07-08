@@ -17,7 +17,7 @@ def create_tel(user_input):
 
     class_ = tel_map.get(user_input)
     if class_:
-        tel = class_(nSlots=3)
+        tel = class_(nSlots=1)
         return tel
     else:
         print("This observatory is not in our pre-built classes. See the telescope.py file for instructions on how to add your own custom built telescope class. Exiting, this will break code.")
