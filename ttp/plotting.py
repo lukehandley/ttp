@@ -36,7 +36,7 @@ def writeStarList(orderData, starttime, current_day, outputpath):
             f.write(orderData['Starname'][i] + "," + formatted_timestamp + "\n")
 
 
-def nightPlan(orderData, current_day, outputdir='plots'):
+def nightPlan(orderData, current_day, outputdir='plots', model=None):
 
     """Create an interactive plot which illustrates the solution.
 
@@ -46,12 +46,52 @@ def nightPlan(orderData, current_day, outputdir='plots'):
         current_day (string): Date of observations, to be included in the
             filename
         outputdir (str): Folder in which to save the html link to the plot
+        model (object): The TTP model object to get unscheduled stars
     """
 
     # reverse the order so that the plot flows from top to bottom with time
     orderData = pd.DataFrame.from_dict(orderData)
     orderData = orderData.iloc[::-1]
     orderData.reset_index(inplace=True)
+    
+    # Add unscheduled stars if model is provided
+    if model is not None and hasattr(model, 'extras'):
+        # Get all unique star names from both scheduled and unscheduled
+        scheduled_stars = set(orderData['Starname'])
+        unscheduled_stars = set(model.extras['Starname'])
+        
+        # Create separate dataframes for scheduled and unscheduled stars
+        scheduled_data = orderData.copy()
+        unscheduled_data = []
+        
+        # Add unscheduled stars to a separate list
+        for i, star_name in enumerate(model.extras['Starname']):
+            if star_name not in scheduled_stars:
+                # Convert time strings back to minutes for unscheduled stars
+                # We need to get the original star object to get proper accessibility times
+                for star_obj in model.stars:
+                    if star_obj.name == star_name:
+                        # Add a row for unscheduled star with no observation data
+                        new_row = {
+                            'Starname': star_name,
+                            'First Available': star_obj.te,
+                            'Last Available': star_obj.tl,
+                            'Start Exposure': None,
+                            'Minutes the from Start of the Night': None,
+                            'Stop Exposure': None,
+                            'N_shots': star_obj.shots,
+                            'Exposure Time (min)': star_obj.exptime,
+                            'Total Exp Time (min)': star_obj.expwithreadout,
+                            'Priority': star_obj.priority
+                        }
+                        unscheduled_data.append(new_row)
+                        break
+        
+        # Combine unscheduled stars (sorted by set time, descending) first, then scheduled stars (so unscheduled appear at bottom after reversal)
+        if unscheduled_data:
+            unscheduled_df = pd.DataFrame(unscheduled_data)
+            unscheduled_df = unscheduled_df.sort_values(by='Last Available', ascending=False)
+            orderData = pd.concat([unscheduled_df, scheduled_data], ignore_index=True)
 
     # Each priority gets a different color. Make sure that each priority is actually included here or the plot will break. Recall bigger numbers are higher priorities.
     colordict = {'10':'red',
@@ -67,10 +107,51 @@ def nightPlan(orderData, current_day, outputdir='plots'):
                 '1':'blue'}
 
     # build the outline of the plot, add dummy points that are not displyed within the x/y limits so as to fill in the legend
-    fig = px.scatter(orderData, x='Minutes the from Start of the Night', y="Starname", hover_data=['First Available', 'Last Available', 'Exposure Time (min)', "N_shots", "Total Exp Time (min)"] ,title='Night Plan', width=800, height=1000) #color='Program'
+    # Calculate height based on number of stars (7 pixels per star)
+    plot_height = max(1000, len(orderData) * 7)
+    fig = px.scatter(orderData, x='Minutes the from Start of the Night', y="Starname", hover_data=['First Available', 'Last Available', 'Exposure Time (min)', "N_shots", "Total Exp Time (min)"] ,title='Night Plan', width=800, height=plot_height) #color='Program'
+    
+    # Update y-axis tick labels to be smaller and rotated
+    fig.update_layout(
+        yaxis=dict(
+            tickfont=dict(size=8),
+            tickangle=45
+        )
+    )
     fig.add_shape(type="rect", x0=-100, x1=-80, y0=-0.5, y1=0.5, fillcolor='red', showlegend=True, name='Expose P1')
     fig.add_shape(type="rect", x0=-100, x1=-80, y0=-0.5, y1=0.5, fillcolor='blue', showlegend=True, name='Expose P3')
     fig.add_shape(type="rect", x0=-100, x1=-80, y0=-0.5, y1=0.5, fillcolor='lime', opacity=0.3, showlegend=True, name='Accessible')
+    
+    # Add section labels for scheduled and unscheduled stars
+    if model is not None and hasattr(model, 'extras'):
+        # Find the boundary between scheduled and unscheduled stars
+        scheduled_count = len(orderData) - len(model.extras['Starname'])
+        if scheduled_count > 0:
+            # Get the x-axis range for positioning labels on the right
+            x_max = orderData['Start Exposure'][0] + orderData["Total Exp Time (min)"][0] if orderData['Start Exposure'][0] is not None else 600
+            
+            # Add label for scheduled stars section (at the top)
+            fig.add_annotation(
+                x=x_max, y=len(orderData)-0.5,
+                text="SCHEDULED STARS",
+                showarrow=False,
+                font=dict(size=14, color="black"),
+                bgcolor="lightgray",
+                bordercolor="black",
+                borderwidth=1,
+                xanchor="right"
+            )
+            # Add label for unscheduled stars section (at the boundary)
+            fig.add_annotation(
+                x=x_max, y=scheduled_count-0.5,
+                text="UNSCHEDULED STARS",
+                showarrow=False,
+                font=dict(size=14, color="black"),
+                bgcolor="lightgray",
+                bordercolor="black",
+                borderwidth=1,
+                xanchor="right"
+            )
 
     new_already_processed = []
     ifixer = 0 # for multi-visit targets, it throws off the one row per target plotting...this fixes it
@@ -80,7 +161,9 @@ def nightPlan(orderData, current_day, outputdir='plots'):
             # find all the times in the night when the star is being visited
             indices = [k for k in range(len(orderData['Starname'])) if orderData['Starname'][k] == orderData['Starname'][i]]
             for j in range(len(indices)):
-                fig.add_shape(type="rect", x0=orderData['Start Exposure'][indices[j]], x1=orderData['Start Exposure'][indices[j]] + orderData["Total Exp Time (min)"][indices[j]], y0=i+ifixer-0.5, y1=i+ifixer+0.5, fillcolor=colordict[str(orderData['Priority'][indices[j]])])
+                # Only add observation rectangles if the star was actually scheduled
+                if orderData['Start Exposure'][indices[j]] is not None:
+                    fig.add_shape(type="rect", x0=orderData['Start Exposure'][indices[j]], x1=orderData['Start Exposure'][indices[j]] + orderData["Total Exp Time (min)"][indices[j]], y0=i+ifixer-0.5, y1=i+ifixer+0.5, fillcolor=colordict[str(orderData['Priority'][indices[j]])])
                 if j == 0:
                     # only do this once, otherwise the green bar gets discolored compared to other rows
                     fig.add_shape(type="rect", x0=orderData['First Available'][indices[j]], x1=orderData['Last Available'][indices[j]], y0=i+ifixer-0.5, y1=i+ifixer+0.5, fillcolor='lime', opacity=0.3, showlegend=False)
@@ -89,7 +172,18 @@ def nightPlan(orderData, current_day, outputdir='plots'):
             # if we already did this star, it is a multi-visit star and we need to adjust the row counter for plotting purposes
             ifixer -= 1
 
-    fig.update_layout(xaxis_range=[0,orderData['Start Exposure'][0] + orderData["Total Exp Time (min)"][0]])
+    # Find the first scheduled observation to set the x-axis range
+    first_scheduled_idx = None
+    for i in range(len(orderData)):
+        if orderData['Start Exposure'][i] is not None:
+            first_scheduled_idx = i
+            break
+    
+    if first_scheduled_idx is not None:
+        fig.update_layout(xaxis_range=[0,orderData['Start Exposure'][first_scheduled_idx] + orderData["Total Exp Time (min)"][first_scheduled_idx]])
+    else:
+        # If no scheduled observations, use a default range
+        fig.update_layout(xaxis_range=[0, 600])
 
     if outputdir != '':
         # Save as both a .html intereactive plot and a low-res png plot

@@ -310,6 +310,7 @@ class TTPModel(object):
         print('Solving TTP for {} exposures with Gurobi'.format(self.N-2))
         self.to_gurobi_model()
         Mod = self.gurobi_model
+        Mod.params.Heuristics = 0.5
         Mod.optimize()
 
 
