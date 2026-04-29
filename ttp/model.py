@@ -155,13 +155,40 @@ class TTPModel(object):
                                     times,targets,grid_times_targets=True)
 
 
-        def to_wrap_frame(angle):
-            if self.observatory.wrapLimitAngle:
-                angle += (360-self.observatory.wrapLimitAngle)
-                angle = np.array([x - 360 if x > 360 else x for x in angle])
-            return angle
+        use_wrap_state = hasattr(self.observatory, 'mech_az_candidates')
 
-        def max_ang_sep(targ1,targ2,slot):
+        def mech_az_for_wrap(sky_az, is_south):
+            """Return mechanical azimuth for a requested wrap branch.
+
+            Branch convention: south=1, north=0.
+            Returns None if the requested branch is not reachable for this sky az.
+            """
+            cands = self.observatory.mech_az_candidates(sky_az)
+            if len(cands) == 1:
+                only = cands[0]
+                only_is_south = only >= 0
+                if bool(is_south) == only_is_south:
+                    return only
+                return None
+            return sky_az if is_south else sky_az - 360
+
+        def az_sep_sample(a1, a2):
+            """Minimum azimuth separation between two sky azimuths, respecting cable wrap."""
+            if use_wrap_state:
+                cands1 = self.observatory.mech_az_candidates(a1)
+                cands2 = self.observatory.mech_az_candidates(a2)
+                return min(abs(x - y) for x in cands1 for y in cands2)
+            elif self.observatory.wrapLimitAngle:
+                a1w = a1 + (360 - self.observatory.wrapLimitAngle)
+                if a1w > 360: a1w -= 360
+                a2w = a2 + (360 - self.observatory.wrapLimitAngle)
+                if a2w > 360: a2w -= 360
+                return abs(a1w - a2w)
+            else:
+                sep = abs(a1 - a2)
+                return 360 - sep if sep > 180 else sep
+
+        def max_ang_sep(targ1,targ2,slot,wrap_pair=None):
 
             slot_ind_start = slot*samples_per_slot
             slot_ind_end = (slot+1)*samples_per_slot-1
@@ -172,29 +199,48 @@ class TTPModel(object):
 
             alt1 = coords1.alt.deg
             alt2 = coords2.alt.deg
-            az1 = to_wrap_frame(coords1.az.deg)
-            az2 = to_wrap_frame(coords2.az.deg)
+            az1 = coords1.az.deg
+            az2 = coords2.az.deg
 
-            # Take the maximum of all the samples, in both dimensions
+            # Take the maximum over time samples.
             alt_sep = np.abs(alt1-alt2)
-            az_sep = np.abs(az1-az2)
-
-            # For telescopes without wraps, no slew greater than 180 deg can exist
-            if not self.observatory.wrapLimitAngle:
-                az_sep = [360 - x if x > 180 else x for x in az_sep]
+            if wrap_pair is None:
+                az_sep = np.array([az_sep_sample(a, b) for a, b in zip(az1, az2)])
+            else:
+                wi, wj = wrap_pair
+                az_sep = []
+                for a, b in zip(az1, az2):
+                    ma = mech_az_for_wrap(a, wi)
+                    mb = mech_az_for_wrap(b, wj)
+                    if ma is None or mb is None:
+                        return np.inf
+                    az_sep.append(abs(ma - mb))
+                az_sep = np.array(az_sep)
 
             return max(max(alt_sep),max(az_sep))
 
         tau_slew = defaultdict(float) # Holds minutes
+        tau_slew_wrap = defaultdict(float) # Holds minutes with explicit (wrap_i, wrap_j)
         for m in range(M):
             for targ1,targ2 in permutations(range(N)[1:-1],2):
                 tau_slew[(targ1,targ2,m)] = np.round(max_ang_sep(targ1,targ2,m)/(60*self.observatory.slewrate),3)
+                if use_wrap_state:
+                    for wi in (0,1):
+                        for wj in (0,1):
+                            sep = max_ang_sep(targ1,targ2,m,wrap_pair=(wi,wj))
+                            if np.isinf(sep):
+                                tau = 1e6
+                            else:
+                                tau = sep/(60*self.observatory.slewrate)
+                            tau_slew_wrap[(targ1,targ2,m,wi,wj)] = np.round(tau,3)
 
         # Slot start and end times as minutes from start
         w = (slot_bounds.jd-slot_bounds[0].jd)*24*60
 
         self.w = w
         self.tau_slew = tau_slew
+        self.tau_slew_wrap = tau_slew_wrap
+        self.use_wrap_state = use_wrap_state
 
 
     def to_gurobi_model(self,output_flag=True):
@@ -225,10 +271,53 @@ class TTPModel(object):
         tau_sep = self.tau_sep
 
         # Variables and Constraints, all with the same conventions as Handley 2024
+        use_wrap_state = getattr(self, 'use_wrap_state', False)
+        tau_slew_wrap = getattr(self, 'tau_slew_wrap', defaultdict(float))
+        internal_nodes = range(1, N-1)
+
         Yi = Mod.addVars(range(N),vtype=GRB.BINARY,name='Yi')
         Xijm = Mod.addVars(range(N),range(N),range(M),vtype=GRB.BINARY,name='Xijm')
         tijm = Mod.addVars(range(N),range(N),range(M),vtype=GRB.CONTINUOUS,name='tijm')
         ti = Mod.addVars(range(N),vtype=GRB.CONTINUOUS,lb=0,name='ti')
+        if use_wrap_state:
+            # Bi: wrap state at each target node (1=south, 0=north)
+            Bi = Mod.addVars(range(N), vtype=GRB.BINARY, name='Bi')
+            # Zijmab: arc selection with explicit source/destination wrap states
+            Zijmab = Mod.addVars(internal_nodes, internal_nodes, range(M), range(2), range(2),
+                                vtype=GRB.BINARY, name='Zijmab')
+
+            Mod.addConstrs((gp.quicksum(Zijmab[i,j,m,a,b] for a in range(2) for b in range(2))
+                           == Xijm[i,j,m]
+                           for i in internal_nodes for j in internal_nodes for m in range(M)),
+                           'z_eq_x')
+            Mod.addConstrs((Zijmab[i,j,m,1,b] <= Bi[i]
+                           for i in internal_nodes for j in internal_nodes for m in range(M) for b in range(2)),
+                           'z_src_south')
+            Mod.addConstrs((Zijmab[i,j,m,0,b] <= 1 - Bi[i]
+                           for i in internal_nodes for j in internal_nodes for m in range(M) for b in range(2)),
+                           'z_src_north')
+            Mod.addConstrs((Zijmab[i,j,m,a,1] <= Bi[j]
+                           for i in internal_nodes for j in internal_nodes for m in range(M) for a in range(2)),
+                           'z_dst_south')
+            Mod.addConstrs((Zijmab[i,j,m,a,0] <= 1 - Bi[j]
+                           for i in internal_nodes for j in internal_nodes for m in range(M) for a in range(2)),
+                           'z_dst_north')
+
+            # Prevent impossible wrap-state arcs (cannot reach hard-limit side for that pair/slot).
+            Mod.addConstrs((Zijmab[i,j,m,a,b] == 0
+                           for i in internal_nodes for j in internal_nodes for m in range(M)
+                           for a in range(2) for b in range(2)
+                           if tau_slew_wrap[(i,j,m,a,b)] >= 1e5),
+                           'z_impossible')
+
+            def slew_term(i, j, m):
+                if i in internal_nodes and j in internal_nodes:
+                    return gp.quicksum(tau_slew_wrap[(i,j,m,a,b)]*Zijmab[i,j,m,a,b]
+                                       for a in range(2) for b in range(2))
+                return tau_slew[(i,j,m)] * Xijm[i,j,m]
+        else:
+            def slew_term(i, j, m):
+                return tau_slew[(i,j,m)] * Xijm[i,j,m]
 
         tijmdef = Mod.addConstrs((ti[i] == gp.quicksum(tijm[i,j,m] for j in range(N)[1:] for m in range(M))
                             for i in range(N)[:-1]),'tijm_def')
@@ -241,14 +330,14 @@ class TTPModel(object):
         flow_constr = Mod.addConstrs(((gp.quicksum(Xijm[i,k,m] for i in range(N)[:-1] for m in range(M))
                         - gp.quicksum(Xijm[k,j,m] for j in range(N)[1:] for m in range(M)) == 0)
                         for k in range(N)[:-1][1:]), 'flow_constr')
-        exp_constr = Mod.addConstrs((ti[j] >= gp.quicksum(tijm[i,j,m] + (tau_slew[(i,j,m)] + tau_exp[j])*Xijm[i,j,m]
-                        for i in range(N)[:-1] for m in range(M)) for j in range(N)[1:])
+        exp_constr = Mod.addConstrs((ti[j] >= gp.quicksum(tijm[i,j,m] + tau_exp[j]*Xijm[i,j,m] + slew_term(i,j,m)
+                for i in range(N)[:-1] for m in range(M)) for j in range(N)[1:])
                         , 'exp_constr')
         t_min = Mod.addConstrs(((tijm[i,j,m] >= w[m]*Xijm[i,j,m]) for j in range(N) for m in range(M)
                         for i in range(N)),'t_min')
         t_max = Mod.addConstrs((tijm[i,j,m] <= w[m+1]*Xijm[i,j,m] for j in range(N) for m in range(M)
                         for i in range(N)),'t_max')
-        rise_constr = Mod.addConstrs((ti[i] >= te[i]*Yi[i] for i in range(N)),'rise_constr')
+        rise_constr = Mod.addConstrs((ti[i] >= (te[i] + tau_exp[i])*Yi[i] for i in range(N)),'rise_constr')
         set_constr = Mod.addConstrs((ti[i] <= tl[i]*Yi[i] for i in range(N)),'set_constr')
 
         #Multivisit constraints
@@ -266,8 +355,8 @@ class TTPModel(object):
 
         # Maximize number of observations, with a penalty term for long slews
         Mod.setObjective(gp.quicksum(priority_param[j]*Yi[j] for j in range(N)[1:-1])
-                            -slew_param *gp.quicksum(tau_slew[(i,j,m)]*Xijm[i,j,m] for i in range(N)[1:-1]
-                                        for j in range(N)[1:-1] for m in range(M))
+                    -slew_param *gp.quicksum(slew_term(i,j,m) for i in range(N)[1:-1]
+                        for j in range(N)[1:-1] for m in range(M))
                             ,GRB.MAXIMIZE)
         print('Building TTP')
         Mod.params.TimeLimit = self.runtime
@@ -361,12 +450,43 @@ class TTPModel(object):
         self.num_scheduled = num_scheduled
 
         # Retrieve slew times for statistics
-        def to_wrap_frame(angle):
-            if self.observatory.wrapLimitAngle:
-                angle += (360-self.observatory.wrapLimitAngle)
-                if angle > 360:
-                    angle -= 360
-            return angle
+        use_wrap_state = getattr(self, 'use_wrap_state', False)
+        tau_slew_wrap = getattr(self, 'tau_slew_wrap', defaultdict(float))
+
+        wrap_state = {}
+        if use_wrap_state:
+            for i in range(1, N-1):
+                bvar = Mod.getVarByName(f'Bi[{i}]')
+                if bvar is not None:
+                    wrap_state[i] = int(np.round(bvar.X, 0))
+
+        def mech_az_for_wrap(sky_az, is_south):
+            cands = self.observatory.mech_az_candidates(sky_az)
+            if len(cands) == 1:
+                only = cands[0]
+                only_is_south = only >= 0
+                if bool(is_south) == only_is_south:
+                    return only
+                return None
+            return sky_az if is_south else sky_az - 360
+
+        def az_sep_pair(a1, a2, wi=None, wj=None):
+            """Azimuth separation between two scalar sky azimuths."""
+            if use_wrap_state and wi is not None and wj is not None:
+                ma = mech_az_for_wrap(a1, wi)
+                mb = mech_az_for_wrap(a2, wj)
+                if ma is None or mb is None:
+                    return np.inf
+                return abs(ma - mb)
+            elif self.observatory.wrapLimitAngle:
+                a1 = a1 + (360 - self.observatory.wrapLimitAngle)
+                if a1 > 360: a1 -= 360
+                a2 = a2 + (360 - self.observatory.wrapLimitAngle)
+                if a2 > 360: a2 -= 360
+                return abs(a1 - a2)
+            else:
+                sep = abs(a1 - a2)
+                return 360 - sep if sep > 180 else sep
 
         # Get slew estimate from the tau tensor
         est_slews = []
@@ -375,7 +495,12 @@ class TTPModel(object):
                 for m in range(M):
                     var = Mod.getVarByName(f'Xijm[{i},{j},{m}]').X
                     if np.round(var,0) ==1:
-                        est_slews.append(tau_slew[i,j,m])
+                        if use_wrap_state and i in wrap_state and j in wrap_state:
+                            wi = wrap_state[i]
+                            wj = wrap_state[j]
+                            est_slews.append(tau_slew_wrap[(i,j,m,wi,wj)])
+                        else:
+                            est_slews.append(tau_slew[i,j,m])
 
         # Compute the real slew at the time the scheduler chose
         real_slews = []
@@ -391,16 +516,12 @@ class TTPModel(object):
 
                         alt1 = altaz1.alt.deg
                         alt2 = altaz2.alt.deg
-                        az1 = to_wrap_frame(altaz1.az.deg)
-                        az2 = to_wrap_frame(altaz2.az.deg)
 
                         alt_sep = np.abs(alt1-alt2)
-                        az_sep = np.abs(az1-az2)
-
-                        # For telescopes without wraps, no slew greater than 180 deg can exist
-                        if not self.observatory.wrapLimitAngle:
-                            if az_sep >= 180:
-                                az_sep = 360 - az_sep
+                        if use_wrap_state and i in wrap_state and j in wrap_state:
+                            az_sep = az_sep_pair(altaz1.az.deg, altaz2.az.deg, wrap_state[i], wrap_state[j])
+                        else:
+                            az_sep = az_sep_pair(altaz1.az.deg, altaz2.az.deg)
 
                         separation = max(alt_sep,az_sep)
                         slew = separation/(60*self.observatory.slewrate)
@@ -429,6 +550,7 @@ class TTPModel(object):
         ordered_target_nodes = []
         all_times = []
         az_path = []
+        mech_az_path = []
         alt_path = []
         order = 0
         for pair in scheduled_targets:
@@ -456,6 +578,19 @@ class TTPModel(object):
             alt_path.append(coords_start_obs.alt.deg)
             az_path.append(coords_end_obs.az.deg)
             alt_path.append(coords_end_obs.alt.deg)
+            if use_wrap_state and hasattr(self.observatory, 'mech_az_candidates') and node_ind in wrap_state:
+                w = wrap_state[node_ind]
+                m1 = mech_az_for_wrap(coords_start_obs.az.deg, w)
+                m2 = mech_az_for_wrap(coords_end_obs.az.deg, w)
+                if m1 is None:
+                    m1 = coords_start_obs.az.deg
+                if m2 is None:
+                    m2 = coords_end_obs.az.deg
+                mech_az_path.append(float(m1))
+                mech_az_path.append(float(m2))
+            else:
+                mech_az_path.append(float(coords_start_obs.az.deg))
+                mech_az_path.append(float(coords_end_obs.az.deg))
             orders.append(order)
             order += 1
 
@@ -487,6 +622,7 @@ class TTPModel(object):
 
         self.times = all_times
         self.az_path = az_path
+        self.mech_az_path = mech_az_path
         self.alt_path = alt_path
 
     def optimization_status(self):
@@ -537,7 +673,7 @@ class TTPModel(object):
         self.time_exposing = time_exposing
         self.solve_time = Mod.Runtime
 
-        file = open(self.outputdir + "TTPstatistics.txt", "w")
+        file = open(self.outputdir + "/TTPstatistics.txt", "w")
         file.write("Stats for TTP Solution" + "\n")
         file.write("------------------------------------" + "\n")
         file.write(f'    Model ran for {self.solve_time:.2f} seconds' + '\n')
