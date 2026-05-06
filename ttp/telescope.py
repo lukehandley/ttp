@@ -36,13 +36,38 @@ class Keck1(object):
         self.observer = Observer.at_site('Keck Observatory', name='Keck', timezone='US/Hawaii')
         self.readOutTime = 45.
         self.slewrate = 6./10. # degrees per second
-        self.wrapLimitAngle = 270 # degrees azimuth
+        self.wrapLimitAngle = None # Dual-wrap model replaces single-wrap logic
+        # Cable wrap geometry: cable_origin +/- cable_reach defines mechanical az limits
+        self.cable_origin = 99.5   # degrees (cable zero-tension point)
+        self.cable_reach  = 224.5  # degrees (max cable travel from origin)
+        # Derived limits: mech_az in [cable_origin - cable_reach, cable_origin + cable_reach]
+        # = [-125, 324]; sky az in [235, 324] has dual mechanical solutions
+        self.wrap_lo = self.cable_origin - self.cable_reach  # -125 deg (sky az 235 on north wrap)
+        self.wrap_hi = self.cable_origin + self.cable_reach  # 324 deg (south wrap hard limit)
         self.deckAzLim1 = 5.3
         self.deckAzLim2 = 146.2
         self.deckAltLim = 33.3
         self.vigLim = 18
         self.zenLim = 84 # Note, this cannot be 0 or no observations can be scheduled.
         self.nSlots = nSlots
+
+    def mech_az_candidates(self, sky_az):
+        """Return list of valid mechanical azimuth positions for a given sky azimuth.
+
+        The cable spans [wrap_lo, wrap_hi] = [-125, 324] degrees of mechanical az.
+        Sky az in [wrap_lo+360, wrap_hi] = [235, 324] has two solutions:
+          - south wrap: mech_az = sky_az  (in [235, 324])
+          - north wrap: mech_az = sky_az - 360  (in [-125, -36])
+        All other sky azimuths have a single mechanical solution.
+        """
+        dual_lo = self.wrap_lo + 360  # 235 deg sky az
+        dual_hi = self.wrap_hi        # 324 deg sky az
+        if sky_az < dual_lo:
+            return [sky_az]           # single solution: south wrap
+        elif sky_az <= dual_hi:
+            return [sky_az, sky_az - 360]  # dual solution
+        else:
+            return [sky_az - 360]    # single solution: north wrap
 
     def pointing_limits(self, az, unvignetted=True):
         '''
@@ -97,7 +122,7 @@ class WIYN(object):
     def __init__(self, nSlots=3):
         self.observer = Observer.at_site('KPNO', name='WIYN', timezone='US/Arizona')
         self.readOutTime = 45.
-        self.slewrate = 10/6. # degrees per second
+        self.slewrate = 0.5 # degrees per second
         self.wrapLimitAngle = 270 # degrees azimuth
         self.deckAzLim1 = 0
         self.deckAzLim2 = 0
